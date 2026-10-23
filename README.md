@@ -1,4 +1,4 @@
-# Rotero
+# Rotero 
 
 <p align="center">
   <img src="assets/icon.png" alt="Rotero" width="128" />
