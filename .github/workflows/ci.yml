@@ -36,8 +36,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
-      # `-D warnings`, not `-W`: with warn-level lints a clippy finding printed
-      # and the job still passed, so this gate never actually gated anything.
+      # -D warnings makes Clippy findings fail the job.
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   fmt:
@@ -56,8 +55,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The rotero-translate coverage tests read the vendored Zotero
-          # translator sources (git submodules) at runtime.
+          # Translator coverage tests use vendored Zotero translator sources.
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -80,16 +78,13 @@ jobs:
           cache-dependency-path: website/package-lock.json
       - run: npm ci
         working-directory: website
-      # Builds with the deployed base path, so a link missing its `base`
-      # prefix fails here rather than only in production.
+      # Build with the deployed base path.
       - name: Build the site
         run: npm run build
         working-directory: website
         env:
           BASE_PATH: /rotero
-      # Report-only for now: this measures how much of the app the guide
-      # covers, and should not block a PR that adds a feature ahead of its
-      # documentation. Turn into a threshold gate once it has settled.
+      # Report-only coverage check.
       - name: Check user guide coverage
         run: node website/tooling/coverage/check.mjs
       - uses: actions/upload-artifact@v4
@@ -139,43 +134,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --target aarch64-apple-ios --features mobile --no-default-features
 
-  # Windows and macOS aren't covered by the Linux jobs above, and the platform
-  # split in the agent/updater code only shows up when it's actually compiled
-  # for those targets.
+  # Check Windows-specific compilation and run tests.
   check-windows:
     name: Check Windows
     runs-on: windows-latest
     env:
-      # Windows runners are the slowest here, and linking dominates. `-C
-      # debuginfo=0` drops PDB generation, which CI never reads.
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
         with:
-          # The rotero-translate coverage tests read the vendored Zotero
-          # translator sources (git submodules) at runtime.
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          # A failed run still leaves a usable dependency cache; without this
-          # the next run recompiles the whole tree again.
           cache-on-failure: true
       - uses: taiki-e/install-action@nextest
-      # `clippy --all-targets` and the test build cannot share artifacts —
-      # clippy stops at metadata while tests need real codegen, so running
-      # both builds the workspace twice. Building the tests first means the
-      # run below reuses what it produced.
       - run: cargo nextest run --workspace --no-run
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo nextest run --workspace
 
-  # macOS is the primary platform and used to be the only one that never ran the
-  # tests — the bug that broke every shipped build landed here.
+  # Run tests on macOS.
   test-macos:
     name: Test macOS
     runs-on: macos-latest
@@ -185,8 +167,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The rotero-translate coverage tests read the vendored Zotero
-          # translator sources (git submodules) at runtime.
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -195,26 +175,12 @@ jobs:
         with:
           cache-on-failure: true
       - uses: taiki-e/install-action@nextest
-      # `clippy --all-targets` and the test build cannot share artifacts —
-      # clippy stops at metadata while tests need real codegen. Same ordering as
-      # the Windows job so the workspace is not built twice.
       - run: cargo nextest run --workspace --no-run
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo nextest run --workspace
 
-  # Builds the real bundle and runs it. Every check above passed while the
-  # shipped artifact was broken, because nothing here had ever launched one:
-  # the app's startup path was not the path the tests exercised.
-  #
-  # Costs a full bundle build (~12 min), so it does not run on every PR — but it
-  # is the only job that exercises a real artifact, which is the thing every
-  # other job was green about while every shipped build was broken. It runs on
-  # master, and on any PR that touches the app or how it is packaged.
-  #
-  # `refs/tags` is deliberately not listed: this workflow has no tag trigger, so
-  # such a condition would never fire. The release workflow runs the same script
-  # on its own artifact before uploading it.
+  # Build the macOS application bundle and smoke-test the real artifact.
   bundle-smoke:
     name: Bundle smoke (macOS)
     runs-on: macos-latest
@@ -231,29 +197,77 @@ jobs:
           cache-on-failure: true
       - uses: cargo-bins/cargo-binstall@b629f84e79e8fbc4f76616a8efd340f3ea605cab # v1.21.1
       - name: Install Dioxus CLI
-        # binstall asks the GitHub API whether a prebuilt `dx` exists for this
-        # target. Unauthenticated, that request shares a per-IP rate limit with
-        # every other runner, and binstall reads the resulting 403 as "no
-        # prebuilt binary available" rather than as a failure -- so it silently
-        # falls back to `cargo install`, which currently cannot compile
-        # dioxus-cli at all (git2 dropped `Cred::credential_helper`). The token
-        # lifts the rate limit, so the artifact that has been published all
-        # along is actually found.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: cargo binstall dioxus-cli --version 0.7.10 -y --force
       - uses: taiki-e/install-action@just
       - name: Free disk before bundle
         run: |
-          # rust-cache can restore debug artifacts; the smoke job only needs
-          # a release .app. hdiutil's DMG also needs a second copy of that
-          # app on disk, which is what filled the runner after pdfrum landed.
           rm -rf target/debug || true
           df -h
       - name: Bundle
-        # .app only — smoke-bundle.sh never mounts a DMG, and creating one
-        # via hdiutil ran the runner out of disk on master after the pdfrum
-        # migration (`hdiutil: create failed - No space left on device`).
         run: dx bundle --release --package-types macos
       - name: Smoke the bundle
         run: ./scripts/smoke-bundle.sh target/dx/rotero/release/macos/Rotero.app
+
+  # Build a native Linux ARM64 Debian package.
+  build-linux-aarch64:
+    name: Build Linux ARM64 DEB
+    runs-on: ubuntu-24.04-arm
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file
+
+      - uses: cargo-bins/cargo-binstall@b629f84e79e8fbc4f76616a8efd340f3ea605cab # v1.21.1
+
+      - name: Install Dioxus CLI
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo binstall dioxus-cli --version 0.7.10 -y --force
+
+      - uses: taiki-e/install-action@just
+
+      - name: Build Linux ARM64 DEB
+        run: dx bundle --release --package-types deb
+
+      - name: Locate Debian packages
+        run: |
+          echo "Searching for generated .deb packages..."
+          find target/dx -type f -name '*.deb' -print
+
+          if ! find target/dx -type f -name '*.deb' -print -quit | grep -q .; then
+            echo "::error::No .deb package was generated. Check Dioxus bundler configuration."
+            exit 1
+          fi
+
+      - name: Upload Linux ARM64 DEB
+        uses: actions/upload-artifact@v4
+        with:
+          name: rotero-linux-aarch64-deb
+          path: target/dx/**/*.deb
+          if-no-files-found: error
+          retention-days: 14
+          
